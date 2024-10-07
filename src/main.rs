@@ -480,7 +480,7 @@ async fn get_embedding(query: &str) -> AppResult<serde_json::Value> {
         .clone())
 }
 
-async fn get_point_payload(client: &reqwest::Client, i: &str) -> AppResult<Payload> {
+async fn get_point_payload(client: &reqwest::Client, i: &str) -> AppResult<ResPayload> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum SN {
@@ -492,7 +492,7 @@ async fn get_point_payload(client: &reqwest::Client, i: &str) -> AppResult<Paylo
         id: Option<SN>,
         version: i64,
         score: f32,
-        payload: Option<Payload>,
+        payload: Option<ResPayload>,
         vector: Option<serde_json::Value>,
         shard_key: Option<serde_json::Value>,
     }
