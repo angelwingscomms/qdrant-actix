@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use futures::future::{err, ok, Ready};
 
 use argon2::{self, Config};
-use rand::Rng;
-use uuid::Uuid;
+use rand::RngCore;
+use rand::rngs::OsRng;
+use base64::{engine::general_purpose, Engine as _};
 
 type AppResult<T> = Result<T, AppError>;
 const COLLECTION: &'static str = "i";
@@ -113,7 +114,7 @@ fn qdrant_path(path: &str) -> AppResult<String> {
 async fn register(reg_data: web::Json<RegistrationData>) -> Result<impl Responder, AppError> {
     let reg_data = reg_data.into_inner();
 
-    // Hash the password
+    // Hash the password using Argon2
     let salt: [u8; 16] = rand::thread_rng().gen();
     let config = Config::default();
     let password_hash = argon2::hash_encoded(reg_data.password.as_bytes(), &salt, &config)
@@ -140,6 +141,7 @@ async fn register(reg_data: web::Json<RegistrationData>) -> Result<impl Responde
             "collections/{}/points?wait",
             COLLECTION
         ))?)
+        .header("Content-Type", "application/json")
         .body(format!(
             r#"{{"points": [{{"id":"{}", "payload": {}}}]}}"#,
             point_id, payload.to_string()
@@ -167,8 +169,8 @@ async fn login(login_data: web::Json<LoginData>) -> Result<impl Responder, AppEr
     .map_err(|e| AppError::new("Verifying password", e))?;
 
     if password_match {
-        // Generate a token
-        let token = generate_token();
+        // Generate a secure token
+        let token = generate_secure_token();
 
         // Store the token in Qdrant associated with the user
         store_token_for_user(&client, &login_data.username, &token).await?;
@@ -191,6 +193,7 @@ async fn logout(auth: Auth) -> Result<impl Responder, AppError> {
             "collections/{}/points/payload/delete?wait",
             COLLECTION
         ))?)
+        .header("Content-Type", "application/json")
         .body(format!(
             r#"{{
                 "points": ["{}"],
@@ -207,10 +210,118 @@ async fn logout(auth: Auth) -> Result<impl Responder, AppError> {
 
 #[post("/search")]
 async fn handle_search(auth: Auth, q: web::Json<SearchQuery>) -> Result<impl Responder, AppError> {
-    // ... existing code ...
+    let q = q.into_inner();
+    let client = reqwest::Client::new();
+    let embedding = serde_json::to_string(
+        &get_embedding(&q.q)
+            .await
+            .map_err(|e| AppError::new("getting embedding", e))?,
+    )
+    .map_err(|e| AppError::new("converting embedding to string in handle search request", e))?;
+
+    let res: serde_json::Value = client
+        .post(&qdrant_path(&format!(
+            "/collections/{}/points/search",
+            COLLECTION
+        ))?)
+        .header("Content-Type", "application/json")
+        .body(format!(
+            r#"{{
+                "vector": {},
+                "limit": {}
+            }}"#,
+            embedding, q.l
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::new("search_points request", e))?
+        .json()
+        .await
+        .map_err(|e| AppError::new("parse search_points response", e))?;
+
+    Ok(HttpResponse::Ok().json(res))
 }
 
-// ... existing handlers ...
+#[get("/")]
+async fn handle_get(auth: Auth, query: web::Query<ItemQuery>) -> Result<impl Responder, AppError> {
+    let query = query.into_inner();
+    let client = reqwest::Client::new();
+
+    match get_point_payload(&client, &query.i).await {
+        Ok(payload) => {
+            if PRIVATE.contains(&payload.c.as_str()) {
+                if payload.u == auth.user {
+                    Ok(HttpResponse::Ok().json(&payload.v))
+                } else {
+                    Ok(HttpResponse::Unauthorized().json("Unauthorized"))
+                }
+            } else {
+                Ok(HttpResponse::Ok().json(&payload))
+            }
+        }
+        Err(_) => Ok(HttpResponse::NotFound().json("Not Found")),
+    }
+}
+
+#[delete("/")]
+async fn handle_delete(auth: Auth, query: web::Query<ItemQuery>) -> Result<impl Responder, AppError> {
+    let query = query.into_inner();
+    let client = reqwest::Client::new();
+    let item = get_point_payload(&client, &query.i)
+        .await
+        .map_err(|e| AppError::new("getting point payload", e))?;
+
+    if item.u == auth.user {
+        client
+            .post(&qdrant_path(&format!(
+                "/collections/{}/points/delete",
+                COLLECTION
+            ))?)
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{
+                    "points": [{}]
+                }}"#,
+                query.i
+            ))
+            .send()
+            .await
+            .map_err(|e| AppError::new("delete_point request", e))?;
+
+        Ok(HttpResponse::Ok().finish())
+    } else {
+        Ok(HttpResponse::Unauthorized().finish())
+    }
+}
+
+#[post("/")]
+async fn handle_add(auth: Auth, s: web::Json<Set>) -> Result<impl Responder, AppError> {
+    let s = s.into_inner();
+    let client = reqwest::Client::new();
+    add(&client, &auth.user, s)
+        .await
+        .map_err(|e| AppError::new("adding point", e))?;
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[put("/")]
+async fn handle_set(auth: Auth, s: web::Json<Set>) -> Result<impl Responder, AppError> {
+    let s = s.into_inner();
+    let client = reqwest::Client::new();
+    match get_point_payload(&client, &s.i).await {
+        Ok(existing_item) => {
+            if existing_item.u == auth.user {
+                set(&client, &auth.user, s)
+                    .await
+                    .map_err(|e| AppError::new("setting point", e))?;
+                Ok(HttpResponse::Ok().finish())
+            } else {
+                Ok(HttpResponse::Unauthorized().finish())
+            }
+        }
+        Err(_) => Ok(HttpResponse::NotFound().finish()),
+    }
+}
 
 // --- REQUEST HELPERS ---
 
@@ -320,8 +431,10 @@ async fn get_user_by_username(client: &reqwest::Client, username: &str) -> AppRe
     }
 }
 
-fn generate_token() -> String {
-    Uuid::new_v4().to_string()
+fn generate_secure_token() -> String {
+    let mut bytes = [0u8; 32]; // 256 bits of entropy
+    OsRng.fill_bytes(&mut bytes);
+    general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
 }
 
 async fn store_token_for_user(client: &reqwest::Client, username: &str, token: &str) -> AppResult<()> {
@@ -336,6 +449,7 @@ async fn store_token_for_user(client: &reqwest::Client, username: &str, token: &
             "collections/{}/points/payload?wait",
             COLLECTION
         ))?)
+        .header("Content-Type", "application/json")
         .body(format!(
             r#"{{
                 "points": ["{}"],
@@ -350,7 +464,108 @@ async fn store_token_for_user(client: &reqwest::Client, username: &str, token: &
     Ok(())
 }
 
-// ... existing helper functions ...
+async fn get_embedding(query: &str) -> AppResult<serde_json::Value> {
+    let url = env::var("EMBEDDING_URL")
+        .unwrap_or_else(|_| "https://fastembedserver.shuttleapp.rs/embeddings".to_string());
+    Ok(reqwest::Client::new()
+        .post(&url)
+        .json(&json!({ "input": query }))
+        .send()
+        .await
+        .map_err(|e| AppError::new("sending get_embedding request", e))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| AppError::new("parsing get_embedding response to json", e))?["data"][0]
+        ["embedding"]
+        .clone())
+}
+
+async fn get_point_payload(client: &reqwest::Client, i: &str) -> AppResult<Payload> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SN {
+        String(String),
+        Integer(i64),
+    }
+    #[derive(Deserialize)]
+    struct ResultItem {
+        id: Option<SN>,
+        version: i64,
+        score: f32,
+        payload: Option<Payload>,
+        vector: Option<serde_json::Value>,
+        shard_key: Option<serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        time: Option<f32>,
+        status: Option<String>,
+        result: Vec<ResultItem>,
+    }
+    let response: Response = client
+        .get(&qdrant_path(&format!(
+            "/collections/{}/points/{}",
+            COLLECTION, i
+        ))?)
+        .send()
+        .await
+        .map_err(|e| AppError::new("get_point request", e))?
+        .json()
+        .await
+        .map_err(|e| AppError::new("parse get_point response", e))?;
+
+    response
+        .result
+        .get(0)
+        .and_then(|res| res.payload.clone())
+        .ok_or_else(|| AppError::new_plain("get_point_payload - no payload on point"))
+}
+
+async fn add(client: &reqwest::Client, user: &str, s: Set) -> AppResult<()> {
+    let embedding = get_embedding(&s.v).await?.to_string();
+    let payload = json!({
+        "c": "",  // category
+        "u": user,
+        "v": s.v,
+    });
+    client
+        .put(&qdrant_path(&format!(
+            "collections/{}/points?wait",
+            COLLECTION
+        ))?)
+        .header("Content-Type", "application/json")
+        .body(format!(
+            r#"{{"points": [{{"id":"{}", "payload": {}, "vector": {}}}]}}"#,
+            s.i, payload.to_string(), embedding
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::new("upsert_points", e))?;
+    Ok(())
+}
+
+async fn set(client: &reqwest::Client, user: &str, s: Set) -> AppResult<()> {
+    let embedding = get_embedding(&s.v).await?.to_string();
+    let payload = json!({
+        "c": "",  // category
+        "u": user,
+        "v": s.v,
+    });
+    client
+        .post(&qdrant_path(&format!(
+            "collections/{}/points?wait",
+            COLLECTION
+        ))?)
+        .header("Content-Type", "application/json")
+        .body(format!(
+            r#"{{"points": [{{"id":"{}", "payload": {}, "vector": {}}}]}}"#,
+            s.i, payload.to_string(), embedding
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::new("upsert_points", e))?;
+    Ok(())
+}
 
 // --- STRUCTS ---
 
@@ -379,4 +594,30 @@ struct SearchQuery {
     r: Vec<String>, // Attributes to return
 }
 
-// ... existing structs ...
+#[derive(Deserialize, Serialize, Clone)]
+struct Item {
+    u: String,            // User
+    i: String,            // ID
+    v: serde_json::Value, // Value field
+    p: bool,              // Private field
+}
+
+#[derive(Deserialize)]
+struct ItemQuery {
+    i: String,
+    c: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Set {
+    i: String, // id
+    v: String, // value
+               // p: bool // private
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ResPayload {
+    c: String, // Category the point belongs to
+    u: String, // User that created it
+    v: String,
+}
